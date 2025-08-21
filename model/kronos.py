@@ -386,7 +386,7 @@ def sample_from_logits(logits, temperature=1.0, top_k=None, top_p=None, sample_l
     return x
 
 
-def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False):
+def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False, return_all_samples=False):
     with torch.no_grad():
         batch_size = x.size(0)
         initial_seq_len = x.size(1)
@@ -436,9 +436,11 @@ def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context
         z = tokenizer.decode(input_tokens, half=True)
         z = z.reshape(batch_size, sample_count, z.size(1), z.size(2))
         preds = z.cpu().numpy()
-        preds = np.mean(preds, axis=1)
-
-        return preds
+        if return_all_samples:
+            return preds  # shape: [B, S, T, D]
+        else:
+            preds = np.mean(preds, axis=1)  # shape: [B, T, D]
+            return preds
 
 
 def calc_time_stamps(x_timestamp):
@@ -467,15 +469,18 @@ class KronosPredictor:
         self.tokenizer = self.tokenizer.to(self.device)
         self.model = self.model.to(self.device)
 
-    def generate(self, x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose):
+    def generate(self, x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose, return_all_samples=False):
 
         x_tensor = torch.from_numpy(np.array(x).astype(np.float32)).to(self.device)
         x_stamp_tensor = torch.from_numpy(np.array(x_stamp).astype(np.float32)).to(self.device)
         y_stamp_tensor = torch.from_numpy(np.array(y_stamp).astype(np.float32)).to(self.device)
 
         preds = auto_regressive_inference(self.tokenizer, self.model, x_tensor, x_stamp_tensor, y_stamp_tensor, self.max_context, pred_len,
-                                          self.clip, T, top_k, top_p, sample_count, verbose)
-        preds = preds[:, -pred_len:, :]
+                                          self.clip, T, top_k, top_p, sample_count, verbose, return_all_samples=return_all_samples)
+        if return_all_samples:
+            preds = preds[:, :, -pred_len:, :]  # [B, S, pred_len, D]
+        else:
+            preds = preds[:, -pred_len:, :]     # [B, pred_len, D]
         return preds
 
     def predict(self, df, x_timestamp, y_timestamp, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True):
@@ -512,10 +517,58 @@ class KronosPredictor:
         x_stamp = x_stamp[np.newaxis, :]
         y_stamp = y_stamp[np.newaxis, :]
 
-        preds = self.generate(x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose)
+        preds = self.generate(x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose, return_all_samples=False)
 
         preds = preds.squeeze(0)
         preds = preds * (x_std + 1e-5) + x_mean
 
         pred_df = pd.DataFrame(preds, columns=self.price_cols + [self.vol_col, self.amt_vol], index=y_timestamp)
         return pred_df
+
+    def predict_with_samples(self, df, x_timestamp, y_timestamp, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=5, verbose=True):
+        """
+        Returns
+        -------
+        mean_pred_df: pd.DataFrame of shape [pred_len, D]
+        samples: np.ndarray of shape [sample_count, pred_len, D]
+        """
+        if not isinstance(df, pd.DataFrame):
+            raise ValueError("Input must be a pandas DataFrame.")
+
+        if not all(col in df.columns for col in self.price_cols):
+            raise ValueError(f"Price columns {self.price_cols} not found in DataFrame.")
+
+        df = df.copy()
+        if self.vol_col not in df.columns:
+            df[self.vol_col] = 0.0
+            df[self.amt_vol] = 0.0
+        if self.amt_vol not in df.columns and self.vol_col in df.columns:
+            df[self.amt_vol] = df[self.vol_col] * df[self.price_cols].mean(axis=1)
+
+        if df[self.price_cols + [self.vol_col, self.amt_vol]].isnull().values.any():
+            raise ValueError("Input DataFrame contains NaN values in price or volume columns.")
+
+        x_time_df = calc_time_stamps(x_timestamp)
+        y_time_df = calc_time_stamps(y_timestamp)
+
+        x = df[self.price_cols + [self.vol_col, self.amt_vol]].values.astype(np.float32)
+        x_stamp = x_time_df.values.astype(np.float32)
+        y_stamp = y_time_df.values.astype(np.float32)
+
+        x_mean, x_std = np.mean(x, axis=0), np.std(x, axis=0)
+        x = (x - x_mean) / (x_std + 1e-5)
+        x = np.clip(x, -self.clip, self.clip)
+
+        x = x[np.newaxis, :]
+        x_stamp = x_stamp[np.newaxis, :]
+        y_stamp = y_stamp[np.newaxis, :]
+
+        preds = self.generate(x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose, return_all_samples=True)
+        # inverse norm: preds shape [B, S, pred_len, D]
+        preds = preds.squeeze(0)  # [S, pred_len, D]
+        preds = preds * (x_std + 1e-5) + x_mean
+
+        # mean over samples for DataFrame
+        mean_preds = preds.mean(axis=0)  # [pred_len, D]
+        mean_pred_df = pd.DataFrame(mean_preds, columns=self.price_cols + [self.vol_col, self.amt_vol], index=y_timestamp)
+        return mean_pred_df, preds
