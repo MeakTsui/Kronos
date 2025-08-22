@@ -572,3 +572,163 @@ class KronosPredictor:
         mean_preds = preds.mean(axis=0)  # [pred_len, D]
         mean_pred_df = pd.DataFrame(mean_preds, columns=self.price_cols + [self.vol_col, self.amt_vol], index=y_timestamp)
         return mean_pred_df, preds
+
+    def predict_batch(self, dfs, x_timestamps, y_timestamps, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True):
+        """
+        批量预测多条序列（多 symbol）。
+
+        参数
+        ----
+        dfs: List[pd.DataFrame]，每个包含 ['open','high','low','close','volume','amount'] 且长度相同
+        x_timestamps: List[pd.Series] 与 dfs 对应，长度相同
+        y_timestamps: List[pd.Series] 与 dfs 对应，长度相同且每个长度为 pred_len
+
+        返回
+        ----
+        List[pd.DataFrame]，每个为对应序列的预测结果 DataFrame，index 使用对应的 y_timestamps[i]
+        """
+        if not (isinstance(dfs, (list, tuple)) and isinstance(x_timestamps, (list, tuple)) and isinstance(y_timestamps, (list, tuple))):
+            raise ValueError("dfs, x_timestamps, y_timestamps 必须为列表并一一对应")
+        B = len(dfs)
+        if not (len(x_timestamps) == B and len(y_timestamps) == B):
+            raise ValueError("dfs, x_timestamps, y_timestamps 长度不一致")
+
+        # 校验长度一致
+        lengths = [len(df) for df in dfs]
+        if len(set(lengths)) != 1:
+            raise ValueError("所有输入序列的长度(lookback)必须一致，方便批量堆叠")
+
+        # 逐序列预处理、时间戳特征与归一化
+        x_list, x_stamp_list, y_stamp_list = [], [], []
+        means, stds = [], []
+
+        for i in range(B):
+            df = dfs[i]
+            if not isinstance(df, pd.DataFrame):
+                raise ValueError(f"第{i}个输入不是 DataFrame")
+            if not all(col in df.columns for col in self.price_cols):
+                raise ValueError(f"第{i}个 DataFrame 缺少价格列 {self.price_cols}")
+
+            df = df.copy()
+            if self.vol_col not in df.columns:
+                df[self.vol_col] = 0.0
+                df[self.amt_vol] = 0.0
+            if self.amt_vol not in df.columns and self.vol_col in df.columns:
+                df[self.amt_vol] = df[self.vol_col] * df[self.price_cols].mean(axis=1)
+
+            if df[self.price_cols + [self.vol_col, self.amt_vol]].isnull().values.any():
+                raise ValueError(f"第{i}个 DataFrame 的价格或成交量列包含 NaN")
+
+            x_ts = x_timestamps[i]
+            y_ts = y_timestamps[i]
+            x_time_df = calc_time_stamps(x_ts)
+            y_time_df = calc_time_stamps(y_ts)
+
+            x = df[self.price_cols + [self.vol_col, self.amt_vol]].values.astype(np.float32)
+            x_stamp = x_time_df.values.astype(np.float32)
+            y_stamp = y_time_df.values.astype(np.float32)
+
+            x_mean, x_std = np.mean(x, axis=0), np.std(x, axis=0)
+            x_norm = (x - x_mean) / (x_std + 1e-5)
+            x_norm = np.clip(x_norm, -self.clip, self.clip)
+
+            x_list.append(x_norm)
+            x_stamp_list.append(x_stamp)
+            y_stamp_list.append(y_stamp)
+            means.append(x_mean)
+            stds.append(x_std)
+
+        # 堆叠为 batch
+        x = np.stack(x_list, axis=0)              # [B, T, D]
+        x_stamp = np.stack(x_stamp_list, axis=0)  # [B, T, timeD]
+        y_stamp = np.stack(y_stamp_list, axis=0)  # [B, pred_len, timeD]
+
+        preds = self.generate(x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose, return_all_samples=False)  # [B, pred_len, D]
+
+        # 反归一化（逐序列）
+        means = np.stack(means, axis=0)[:, np.newaxis, :]  # [B,1,D]
+        stds = np.stack(stds, axis=0)[:, np.newaxis, :]
+        preds = preds * (stds + 1e-5) + means
+
+        # 拆成列表 DataFrame
+        out = []
+        for i in range(B):
+            df_i = pd.DataFrame(preds[i], columns=self.price_cols + [self.vol_col, self.amt_vol], index=y_timestamps[i])
+            out.append(df_i)
+        return out
+
+    def predict_with_samples_batch(self, dfs, x_timestamps, y_timestamps, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=5, verbose=True):
+        """
+        批量预测并返回样本集合，用于不确定性可视化。
+
+        返回
+        ----
+        mean_dfs: List[pd.DataFrame]，每条序列的均值预测
+        samples:  np.ndarray，形状 [B, sample_count, pred_len, D]（反归一化后）
+        """
+        if not (isinstance(dfs, (list, tuple)) and isinstance(x_timestamps, (list, tuple)) and isinstance(y_timestamps, (list, tuple))):
+            raise ValueError("dfs, x_timestamps, y_timestamps 必须为列表并一一对应")
+        B = len(dfs)
+        if not (len(x_timestamps) == B and len(y_timestamps) == B):
+            raise ValueError("dfs, x_timestamps, y_timestamps 长度不一致")
+
+        lengths = [len(df) for df in dfs]
+        if len(set(lengths)) != 1:
+            raise ValueError("所有输入序列的长度(lookback)必须一致，方便批量堆叠")
+
+        x_list, x_stamp_list, y_stamp_list = [], [], []
+        means, stds = [], []
+        for i in range(B):
+            df = dfs[i]
+            if not isinstance(df, pd.DataFrame):
+                raise ValueError(f"第{i}个输入不是 DataFrame")
+            if not all(col in df.columns for col in self.price_cols):
+                raise ValueError(f"第{i}个 DataFrame 缺少价格列 {self.price_cols}")
+
+            df = df.copy()
+            if self.vol_col not in df.columns:
+                df[self.vol_col] = 0.0
+                df[self.amt_vol] = 0.0
+            if self.amt_vol not in df.columns and self.vol_col in df.columns:
+                df[self.amt_vol] = df[self.vol_col] * df[self.price_cols].mean(axis=1)
+
+            if df[self.price_cols + [self.vol_col, self.amt_vol]].isnull().values.any():
+                raise ValueError(f"第{i}个 DataFrame 的价格或成交量列包含 NaN")
+
+            x_ts = x_timestamps[i]
+            y_ts = y_timestamps[i]
+            x_time_df = calc_time_stamps(x_ts)
+            y_time_df = calc_time_stamps(y_ts)
+
+            x = df[self.price_cols + [self.vol_col, self.amt_vol]].values.astype(np.float32)
+            x_stamp = x_time_df.values.astype(np.float32)
+            y_stamp = y_time_df.values.astype(np.float32)
+
+            x_mean, x_std = np.mean(x, axis=0), np.std(x, axis=0)
+            x_norm = (x - x_mean) / (x_std + 1e-5)
+            x_norm = np.clip(x_norm, -self.clip, self.clip)
+
+            x_list.append(x_norm)
+            x_stamp_list.append(x_stamp)
+            y_stamp_list.append(y_stamp)
+            means.append(x_mean)
+            stds.append(x_std)
+
+        x = np.stack(x_list, axis=0)              # [B, T, D]
+        x_stamp = np.stack(x_stamp_list, axis=0)  # [B, T, timeD]
+        y_stamp = np.stack(y_stamp_list, axis=0)  # [B, pred_len, timeD]
+
+        preds = self.generate(x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose, return_all_samples=True)  # [B, S, pred_len, D]
+
+        means = np.stack(means, axis=0)[:, np.newaxis, np.newaxis, :]  # [B,1,1,D]
+        stds = np.stack(stds, axis=0)[:, np.newaxis, np.newaxis, :]
+        preds = preds * (stds + 1e-5) + means  # 反归一化
+
+        # 生成均值 DataFrame 列表
+        mean_preds = preds.mean(axis=1)  # [B, pred_len, D]
+        mean_dfs = []
+        for i in range(B):
+            df_i = pd.DataFrame(mean_preds[i], columns=self.price_cols + [self.vol_col, self.amt_vol], index=y_timestamps[i])
+            mean_dfs.append(df_i)
+
+        return mean_dfs, preds
