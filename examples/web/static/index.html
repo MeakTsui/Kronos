@@ -19,6 +19,8 @@
     button { padding: 8px 12px; border: 1px solid #0a7; background: #0a7; color: #fff; border-radius: 6px; cursor: pointer; }
     button:disabled { opacity: .6; cursor: not-allowed; }
     #chart { height: 560px; }
+    .plots { display: grid; grid-template-columns: 1fr; gap: 12px; margin-top: 12px; }
+    .plot { height: 360px; }
     .muted { color: #777; font-size: 12px; }
   </style>
 </head>
@@ -54,15 +56,40 @@
       <div class="row"><label>Show Band</label><input id="show_band" type="checkbox" checked /></div>
       <div class="row"><label>Band Low</label><input id="band_low" type="number" value="10" /></div>
       <div class="row"><label>Band High</label><input id="band_high" type="number" value="90" /></div>
+      <hr/>
+      <div class="row"><label>Prob Mode</label>
+        <select id="prob_mode">
+          <option value="sampling" selected>Sampling</option>
+          <option value="beam">Beam</option>
+        </select>
+      </div>
+      <div class="row"><label>Beam top_k1</label><input id="beam_top_k1" type="number" value="16" /></div>
+      <div class="row"><label>Beam top_k2</label><input id="beam_top_k2" type="number" value="8" /></div>
+      <div class="row"><label>Beam width</label><input id="beam_width" type="number" value="32" /></div>
       <div class="row"><button id="run">Run Prediction</button></div>
       <div class="muted">The backend must be running at /predict on the same origin.</div>
     </div>
     <div class="card" style="overflow: hidden;">
       <div id="chart"></div>
+      <div class="plots">
+        <div>
+          <div class="muted">Probability Heatmap (Close over Time×Price) + Ridge</div>
+          <div id="heatmap" class="plot"></div>
+        </div>
+        <div>
+          <div class="muted">Probability Contour + Ridge</div>
+          <div id="contour" class="plot"></div>
+        </div>
+        <div>
+          <div class="muted">Fan Chart (p10–p90 band, median)</div>
+          <div id="fan" class="plot"></div>
+        </div>
+      </div>
     </div>
   </div>
 
   <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>
