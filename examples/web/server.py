@@ -572,11 +572,12 @@ def predict_prob_beam(req: ProbBeamRequest):
 
 # Remote service config (e.g., Cloudflare Workers)
 CRICKET_API_BASE = os.getenv("CRICKET_API_BASE", "https://app.cricket-ai.xyz")
-CRICKET_API_KEY = os.getenv("CRICKET_API_KEY", "")  # Bearer token for auth
+# CRICKET_API_BASE = os.getenv("CRICKET_API_BASE", "http://localhost:8787")
+CRICKET_API_KEY = os.getenv("CRICKET_API_KEY", "Nbb@123")  # Bearer token for auth
 
 # Scheduler controls
-SCHED_ENABLED = os.getenv("SCHED_ENABLED", "false").lower() == "true"
-SCHED_INTERVAL_SEC = int(os.getenv("SCHED_INTERVAL_SEC", "180"))
+SCHED_ENABLED = os.getenv("SCHED_ENABLED", "true").lower() == "true"
+SCHED_INTERVAL_SEC = int(os.getenv("SCHED_INTERVAL_SEC", "120"))
 
 # Default prediction params when remote job omits fields
 DEFAULT_LOOKBACK = int(os.getenv("DEFAULT_LOOKBACK", "400"))
@@ -596,7 +597,7 @@ def _auth_headers() -> Dict[str, str]:
 
 
 def _fetch_symbols_to_predict() -> List[Dict[str, Any]]:
-    url = f"{CRICKET_API_BASE}/api/symbols"
+    url = f"{CRICKET_API_BASE}/api/v1/ai/symbols"
     try:
         r = requests.get(url, headers=_auth_headers(), timeout=10)
         r.raise_for_status()
@@ -608,7 +609,7 @@ def _fetch_symbols_to_predict() -> List[Dict[str, Any]]:
 
 
 def _post_prediction(payload: Dict[str, Any]) -> None:
-    url = f"{CRICKET_API_BASE}/api/predictions"
+    url = f"{CRICKET_API_BASE}/api/v1/ai/predictions"
     try:
         r = requests.post(url, headers=_auth_headers(), json=payload, timeout=20)
         if r.status_code >= 300:
