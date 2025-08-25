@@ -578,6 +578,7 @@ CRICKET_API_KEY = os.getenv("CRICKET_API_KEY", "Nbb@123")  # Bearer token for au
 # Scheduler controls
 SCHED_ENABLED = os.getenv("SCHED_ENABLED", "true").lower() == "true"
 SCHED_INTERVAL_SEC = int(os.getenv("SCHED_INTERVAL_SEC", "120"))
+SCHED_BATCH_SIZE = int(os.getenv("SCHED_BATCH_SIZE", "4"))
 
 # Default prediction params when remote job omits fields
 DEFAULT_LOOKBACK = int(os.getenv("DEFAULT_LOOKBACK", "400"))
@@ -678,98 +679,116 @@ async def _scheduler_loop():
                 if not dfs:
                     continue
 
-                # Predict in batch
+                # Predict in mini-batches to control GPU memory
                 try:
-                    if show_band and samples >= 2:
-                        mean_dfs, samples_arr = predictor.predict_with_samples_batch(
-                            dfs=dfs,
-                            x_timestamps=x_ts_list,
-                            y_timestamps=y_ts_list,
-                            pred_len=pred_len,
-                            T=1.0,
-                            top_k=0,
-                            top_p=0.9,
-                            sample_count=samples,
-                            verbose=False,
-                        )
-                    else:
-                        mean_dfs = predictor.predict_batch(
-                            dfs=dfs,
-                            x_timestamps=x_ts_list,
-                            y_timestamps=y_ts_list,
-                            pred_len=pred_len,
-                            T=1.0,
-                            top_k=0,
-                            top_p=0.9,
-                            sample_count=samples,
-                            verbose=False,
-                        )
-                        samples_arr = None
+                    def to_epoch(ts):
+                        return int(pd.Timestamp(ts).timestamp())
+
+                    B = max(1, int(SCHED_BATCH_SIZE))
+                    N = len(dfs)
+                    for start in range(0, N, B):
+                        end = min(start + B, N)
+                        dfs_b = dfs[start:end]
+                        x_ts_b = x_ts_list[start:end]
+                        y_ts_b = y_ts_list[start:end]
+                        symbols_b = symbols[start:end]
+
+                        # Run prediction for this sub-batch
+                        if show_band and samples >= 2:
+                            mean_dfs_b, samples_arr_b = predictor.predict_with_samples_batch(
+                                dfs=dfs_b,
+                                x_timestamps=x_ts_b,
+                                y_timestamps=y_ts_b,
+                                pred_len=pred_len,
+                                T=1.0,
+                                top_k=0,
+                                top_p=0.9,
+                                sample_count=samples,
+                                verbose=False,
+                            )
+                        else:
+                            mean_dfs_b = predictor.predict_batch(
+                                dfs=dfs_b,
+                                x_timestamps=x_ts_b,
+                                y_timestamps=y_ts_b,
+                                pred_len=pred_len,
+                                T=1.0,
+                                top_k=0,
+                                top_p=0.9,
+                                sample_count=samples,
+                                verbose=False,
+                            )
+                            samples_arr_b = None
+
+                        # Push each item in sub-batch immediately, then free memory
+                        for local_idx, symbol in enumerate(symbols_b):
+                            df_hist = dfs_b[local_idx]
+                            x_ts = x_ts_b[local_idx]
+                            pred_df = mean_dfs_b[local_idx]
+                            y_ts = y_ts_b[local_idx]
+
+                            history = [
+                                {
+                                    "time": to_epoch(t),
+                                    "open": float(r.open),
+                                    "high": float(r.high),
+                                    "low": float(r.low),
+                                    "close": float(r.close),
+                                    "volume": float(r.volume),
+                                }
+                                for t, r in zip(x_ts, df_hist.itertuples(index=False))
+                            ]
+
+                            prediction = [
+                                {
+                                    "time": to_epoch(t),
+                                    "open": float(r.open),
+                                    "high": float(r.high),
+                                    "low": float(r.low),
+                                    "close": float(r.close),
+                                    "volume": float(r.volume),
+                                }
+                                for t, r in zip(pd.DatetimeIndex(y_ts), pred_df.itertuples(index=False))
+                            ]
+
+                            band_low_payload = band_high_payload = None
+                            if samples_arr_b is not None:
+                                close_idx = 3
+                                low_vals = np.percentile(samples_arr_b[local_idx, :, :, close_idx], band_low, axis=0)
+                                high_vals = np.percentile(samples_arr_b[local_idx, :, :, close_idx], band_high, axis=0)
+                                band_low_payload = [
+                                    {"time": to_epoch(t), "value": float(v)}
+                                    for t, v in zip(pd.DatetimeIndex(y_ts), low_vals)
+                                ]
+                                band_high_payload = [
+                                    {"time": to_epoch(t), "value": float(v)}
+                                    for t, v in zip(pd.DatetimeIndex(y_ts), high_vals)
+                                ]
+
+                            payload = {
+                                "symbol": symbol,
+                                "interval": interval,
+                                "lookback": lookback,
+                                "pred_len": pred_len,
+                                "samples": samples,
+                                "created_at": int(pd.Timestamp.utcnow().timestamp()),
+                                "history": history,
+                                "prediction": prediction,
+                                "band_low": band_low_payload,
+                                "band_high": band_high_payload,
+                            }
+                            _post_prediction(payload)
+
+                        # Try freeing CUDA memory between batches
+                        if torch.cuda.is_available():
+                            try:
+                                torch.cuda.empty_cache()
+                            except Exception:
+                                pass
+
                 except Exception as e:
                     print(f"[scheduler] predict batch error: {e}")
                     continue
-
-                # Build and push per-symbol payloads
-                def to_epoch(ts):
-                    return int(pd.Timestamp(ts).timestamp())
-
-                for idx, symbol in enumerate(symbols):
-                    df_hist = dfs[idx]
-                    x_ts = x_ts_list[idx]
-                    pred_df = mean_dfs[idx]
-                    y_ts = y_ts_list[idx]
-
-                    history = [
-                        {
-                            "time": to_epoch(t),
-                            "open": float(r.open),
-                            "high": float(r.high),
-                            "low": float(r.low),
-                            "close": float(r.close),
-                            "volume": float(r.volume),
-                        }
-                        for t, r in zip(x_ts, df_hist.itertuples(index=False))
-                    ]
-
-                    prediction = [
-                        {
-                            "time": to_epoch(t),
-                            "open": float(r.open),
-                            "high": float(r.high),
-                            "low": float(r.low),
-                            "close": float(r.close),
-                            "volume": float(r.volume),
-                        }
-                        for t, r in zip(pd.DatetimeIndex(y_ts), pred_df.itertuples(index=False))
-                    ]
-
-                    band_low_payload = band_high_payload = None
-                    if samples_arr is not None:
-                        close_idx = 3
-                        low_vals = np.percentile(samples_arr[idx, :, :, close_idx], band_low, axis=0)
-                        high_vals = np.percentile(samples_arr[idx, :, :, close_idx], band_high, axis=0)
-                        band_low_payload = [
-                            {"time": to_epoch(t), "value": float(v)}
-                            for t, v in zip(pd.DatetimeIndex(y_ts), low_vals)
-                        ]
-                        band_high_payload = [
-                            {"time": to_epoch(t), "value": float(v)}
-                            for t, v in zip(pd.DatetimeIndex(y_ts), high_vals)
-                        ]
-
-                    payload = {
-                        "symbol": symbol,
-                        "interval": interval,
-                        "lookback": lookback,
-                        "pred_len": pred_len,
-                        "samples": samples,
-                        "created_at": int(pd.Timestamp.utcnow().timestamp()),
-                        "history": history,
-                        "prediction": prediction,
-                        "band_low": band_low_payload,
-                        "band_high": band_high_payload,
-                    }
-                    _post_prediction(payload)
 
         except Exception as e:
             print(f"[scheduler] loop error: {e}")
