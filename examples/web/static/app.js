@@ -100,6 +100,50 @@ function renderFan(prob){
   }, {responsive:true});
 }
 
+function renderExplain(prob){
+  // prob: { times, priceGrid, probMatrix, ridge_path, mode_from_hist?, expected_from_hist? }
+  const heat = {
+    x: prob.times.map((_, i) => i),
+    y: prob.priceGrid,
+    z: prob.probMatrix,
+    type: 'heatmap',
+    colorscale: 'Viridis',
+    colorbar: { title: 'Prob' },
+  };
+  const traces = [heat];
+  if (prob.ridge_path && prob.ridge_path.length) {
+    traces.push({
+      x: prob.times.map((_, i) => i),
+      y: prob.ridge_path,
+      type: 'scatter', mode: 'lines', name: 'Ridge (Path Close)',
+      line: { color: 'white', width: 2 },
+    });
+  }
+  if (prob.mode_from_hist && prob.mode_from_hist.length) {
+    traces.push({
+      x: prob.times.map((_, i) => i),
+      y: prob.mode_from_hist,
+      type: 'scatter', mode: 'lines', name: 'Mode',
+      line: { color: 'yellow', width: 1 },
+    });
+  }
+  if (prob.expected_from_hist && prob.expected_from_hist.length) {
+    traces.push({
+      x: prob.times.map((_, i) => i),
+      y: prob.expected_from_hist,
+      type: 'scatter', mode: 'lines', name: 'Expected',
+      line: { color: '#2e6cf6', width: 1, dash: 'dot' },
+    });
+  }
+  Plotly.newPlot('explain_heatmap', traces, {
+    margin: {l:40,r:10,t:10,b:30},
+    xaxis: { title: 'Step' },
+    yaxis: { title: 'Price' },
+    showlegend: true,
+    legend: { orientation: 'h' },
+  }, {responsive:true});
+}
+
 async function runPrediction() {
   const payload = {
     symbol: el('symbol').value.trim().toUpperCase(),
@@ -198,6 +242,61 @@ async function runPrediction() {
 }
 
 el('run').addEventListener('click', runPrediction);
+
+async function runExplain() {
+  const base = {
+    symbol: el('symbol').value.trim().toUpperCase(),
+    interval: el('interval').value,
+    lookback: parseInt(el('lookback').value, 10),
+    pred_len: parseInt(el('pred_len').value, 10),
+    T: parseFloat(el('T').value),
+    top_p: parseFloat(el('top_p').value),
+    top_k: parseInt(el('top_k').value, 10),
+  };
+  const body = Object.assign({}, base, {
+    bins: parseInt(el('ex_bins').value, 10),
+    normalize: el('ex_normalize').value,
+    top_k1: parseInt(el('ex_top_k1').value, 10),
+    top_k2: parseInt(el('ex_top_k2').value, 10),
+    sample_path: el('ex_sample_path').checked,
+    include_mode: el('ex_include_mode').checked,
+    include_expected: el('ex_include_expected').checked,
+  });
+  const btn = el('run_explain');
+  btn.disabled = true; btn.textContent = 'Explaining...';
+  try {
+    const res = await fetch('/explain_predict_path', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error(`HTTP ${res.status}: ${txt}`);
+    }
+    const data = await res.json();
+
+    // Optionally update predicted line from explain path result
+    if (Array.isArray(data.prediction)) {
+      const predLine = data.prediction.map(c => ({ time: c.time, value: c.close }));
+      predLineSeries.setData(predLine);
+    }
+
+    renderExplain({
+      times: data.times,
+      priceGrid: data.priceGrid,
+      probMatrix: data.probMatrix,
+      ridge_path: data.ridge_path,
+      mode_from_hist: data.mode_from_hist,
+      expected_from_hist: data.expected_from_hist,
+    });
+  } catch (err) {
+    alert(err.message || String(err));
+  } finally {
+    btn.disabled = false; btn.textContent = 'Explain Path';
+  }
+}
+
+el('run_explain').addEventListener('click', runExplain);
 
 // Initial run
 runPrediction();

@@ -68,6 +68,20 @@
       <div class="row"><label>Beam width</label><input id="beam_width" type="number" value="32" /></div>
       <div class="row"><button id="run">Run Prediction</button></div>
       <div class="muted">The backend must be running at /predict on the same origin.</div>
+      <hr/>
+      <div class="row"><label>Explain Bins</label><input id="ex_bins" type="number" value="128" /></div>
+      <div class="row"><label>Normalize</label>
+        <select id="ex_normalize">
+          <option value="column" selected>column</option>
+          <option value="global">global</option>
+        </select>
+      </div>
+      <div class="row"><label>top_k1 (s1)</label><input id="ex_top_k1" type="number" value="16" /></div>
+      <div class="row"><label>top_k2 (s2)</label><input id="ex_top_k2" type="number" value="8" /></div>
+      <div class="row"><label>Sample Path</label><input id="ex_sample_path" type="checkbox" checked /></div>
+      <div class="row"><label>Include Mode</label><input id="ex_include_mode" type="checkbox" checked /></div>
+      <div class="row"><label>Include Expected</label><input id="ex_include_expected" type="checkbox" checked /></div>
+      <div class="row"><button id="run_explain">Explain Path</button></div>
     </div>
     <div class="card" style="overflow: hidden;">
       <div id="chart"></div>
@@ -79,6 +93,10 @@
         <div>
           <div class="muted">Probability Contour + Ridge</div>
           <div id="contour" class="plot"></div>
+        </div>
+        <div>
+          <div class="muted">Explain Path Heatmap + Ridge/Mode/Expected</div>
+          <div id="explain_heatmap" class="plot"></div>
         </div>
         <div>
           <div class="muted">Fan Chart (p10–p90 band, median)</div>

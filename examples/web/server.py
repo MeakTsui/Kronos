@@ -20,6 +20,7 @@ PROJ_ROOT = os.path.abspath(os.path.join(CUR_DIR, "..", ".."))
 sys.path.append(PROJ_ROOT)
 
 from model import Kronos, KronosTokenizer, KronosPredictor  # noqa: E402
+from model.kronos import top_k_top_p_filtering, sample_from_logits  # align sampling logic
 
 BINANCE_BASE = "https://api.binance.com"
 INTERVAL_TO_PANDAS = {
@@ -87,6 +88,41 @@ class ProbResponse(BaseModel):
     probMatrix: List[List[float]]  # shape [len(priceGrid)][len(times)]
     ridge: List[float]  # argmax price per time
     quantiles: Dict[str, List[float]]  # {"p10":[],"p50":[],"p90":[]}
+
+
+class ExplainPredictPathRequest(BaseModel):
+    symbol: str = Field("BTCUSDT", description="Binance symbol, e.g., BTCUSDT")
+    interval: str = Field("5m", description="Kline interval, e.g., 1m,5m,1h")
+    lookback: int = Field(400, ge=50, le=1024)
+    pred_len: int = Field(15, ge=1, le=256)
+    device: str = Field("cuda:0")
+    # decoding params
+    T: float = Field(1.0, ge=0.1, le=2.0)
+    top_p: float = Field(0.9, ge=0.1, le=1.0)
+    top_k: int = Field(0, ge=0, le=1024)
+    # histogram/grid controls
+    bins: int = Field(128, ge=20, le=512, description="price grid size for histogram")
+    normalize: str = Field("column", description="'column' or 'global'")
+    # local expansion fan per step
+    top_k1: int = Field(16, ge=1, le=512, description="number of s1 candidates per step")
+    top_k2: int = Field(8, ge=1, le=512, description="number of s2 candidates per s1")
+    # whether to sample or greedy for the chosen path
+    sample_path: bool = Field(True, description="sample path using nucleus/top-k; if False, greedy")
+    # optional outputs
+    include_mode: bool = Field(True, description="include mode_from_hist line")
+    include_expected: bool = Field(True, description="include expected_from_hist line")
+
+
+class ExplainPredictPathResponse(BaseModel):
+    symbol: str
+    interval: str
+    times: List[int]
+    prediction: List[dict]
+    priceGrid: List[float]
+    probMatrix: List[List[float]]
+    ridge_path: List[float]
+    mode_from_hist: Optional[List[float]] = None
+    expected_from_hist: Optional[List[float]] = None
 
 
 def fetch_binance_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
@@ -568,6 +604,222 @@ def predict_prob_beam(req: ProbBeamRequest):
             probMatrix=Z.tolist(),
             ridge=ridge_prices,
             quantiles={"p10": p10, "p50": p50, "p90": p90},
+        )
+
+
+# ---------------------- Explain predict path (single-path + per-step hist) ----------------------
+@app.post("/explain_predict_path", response_model=ExplainPredictPathResponse)
+def explain_predict_path(req: ExplainPredictPathRequest):
+    # 1) Fetch history
+    limit = max(req.lookback + 5, req.lookback)
+    df = fetch_binance_klines(req.symbol, req.interval, limit)
+    if df.shape[0] < req.lookback:
+        raise HTTPException(status_code=400, detail="Not enough data from Binance")
+    df = df.tail(req.lookback).reset_index(drop=True)
+
+    # 2) Prepare inputs
+    x_df = df[["open", "high", "low", "close", "volume", "amount"]].copy()
+    x_timestamp = df["timestamps"].copy()
+    last_ts = df["timestamps"].iloc[-1]
+    y_ts = pd.Series(make_future_timestamps(last_ts, req.interval, req.pred_len))
+
+    # Build normalized tensors similar to KronosPredictor
+    x = x_df.values.astype(np.float32)
+    x_time_df = pd.DataFrame({
+        'minute': x_timestamp.dt.minute,
+        'hour': x_timestamp.dt.hour,
+        'weekday': x_timestamp.dt.weekday,
+        'day': x_timestamp.dt.day,
+        'month': x_timestamp.dt.month,
+    }).values.astype(np.float32)
+    y_time_df = pd.DataFrame({
+        'minute': y_ts.dt.minute,
+        'hour': y_ts.dt.hour,
+        'weekday': y_ts.dt.weekday,
+        'day': y_ts.dt.day,
+        'month': y_ts.dt.month,
+    }).values.astype(np.float32)
+
+    x_mean, x_std = np.mean(x, axis=0), np.std(x, axis=0)
+    x_norm = (x - x_mean) / (x_std + 1e-5)
+    x_norm = np.clip(x_norm, -predictor.clip, predictor.clip)
+
+    device = predictor.device
+    with torch.no_grad():
+        x_tensor = torch.from_numpy(x_norm).unsqueeze(0).to(device)
+        x_stamp = torch.from_numpy(x_time_df).unsqueeze(0).to(device)
+        y_stamp = torch.from_numpy(y_time_df).unsqueeze(0).to(device)
+
+        # Tokenize history once
+        x_token = predictor.tokenizer.encode(x_tensor, half=True)
+
+        def get_dynamic_stamp(x_stamp, y_stamp, current_seq_len, pred_step):
+            if current_seq_len <= predictor.max_context - pred_step:
+                return torch.cat([x_stamp, y_stamp[:, :pred_step, :]], dim=1)
+            else:
+                start_idx = predictor.max_context - pred_step
+                return torch.cat([x_stamp[:, -start_idx:, :], y_stamp[:, :pred_step, :]], dim=1)
+
+        # Evolving path tokens
+        s1_cur = x_token[0].clone()
+        s2_cur = x_token[1].clone()
+
+        # Per-step candidate values and weights
+        step_values: List[np.ndarray] = []
+        step_weights: List[np.ndarray] = []
+        path_closes: List[float] = []
+
+        for i in range(req.pred_len):
+            # Truncate to max context if needed
+            if s1_cur.size(1) <= predictor.max_context:
+                s1_in, s2_in = s1_cur, s2_cur
+            else:
+                s1_in = s1_cur[:, -predictor.max_context:]
+                s2_in = s2_cur[:, -predictor.max_context:]
+
+            current_seq_len = s1_in.size(1)
+            current_stamp = get_dynamic_stamp(x_stamp, y_stamp, current_seq_len, i)
+
+            # Decode s1
+            s1_logits, context = predictor.model.decode_s1(s1_in, s2_in, current_stamp)
+            s1_logits_last = s1_logits[:, -1, :] / req.T
+
+            # Choose path s1 token
+            s1_logits_path = s1_logits_last.clone()
+            if req.top_k > 0 or req.top_p < 1.0:
+                s1_logits_path = top_k_top_p_filtering(s1_logits_path, top_k=int(req.top_k), top_p=float(req.top_p))
+            if req.sample_path:
+                s1_id = sample_from_logits(s1_logits_path, temperature=1.0, top_k=None, top_p=None, sample_logits=True).view(1, 1)
+            else:
+                probs = torch.softmax(s1_logits_path, dim=-1)
+                s1_id = torch.topk(probs, k=1, dim=-1)[1].view(1, 1)
+
+            # For histogram: top-k1 over s1 candidates
+            s1_probs_full = torch.softmax(s1_logits_last, dim=-1)
+            k1 = min(int(req.top_k1), s1_probs_full.size(-1))
+            s1_prob_vals, s1_idx = torch.topk(s1_probs_full, k1, dim=-1)
+
+            cand_s1_list, cand_s2_list, cand_w_list = [], [], []
+            for c_ix in range(k1):
+                s1_cand = s1_idx[0, c_ix:c_ix+1].view(1, 1)
+                p1 = float(s1_prob_vals[0, c_ix].item())
+                s2_logits = predictor.model.decode_s2(context, s1_cand)
+                s2_logits_last = s2_logits[:, -1, :] / req.T
+                s2_probs = torch.softmax(s2_logits_last, dim=-1)
+                k2 = min(int(req.top_k2), s2_probs.size(-1))
+                s2_prob_vals, s2_idx = torch.topk(s2_probs, k2, dim=-1)
+                for d_ix in range(k2):
+                    s2_cand = s2_idx[0, d_ix:d_ix+1].view(1, 1)
+                    p2 = float(s2_prob_vals[0, d_ix].item())
+                    cand_s1_list.append(torch.cat([s1_cur, s1_cand.to(device)], dim=1))
+                    cand_s2_list.append(torch.cat([s2_cur, s2_cand.to(device)], dim=1))
+                    cand_w_list.append(p1 * p2)
+
+            # Decode all candidates to last-step Close
+            s1_dec = torch.cat(cand_s1_list, dim=0)
+            s2_dec = torch.cat(cand_s2_list, dim=0)
+            z = predictor.tokenizer.decode([s1_dec, s2_dec], half=True)
+            last_close = z[:, -1, 3].detach().cpu().numpy()
+            closes = last_close * (x_std[3] + 1e-5) + x_mean[3]
+            ws = np.array(cand_w_list, dtype=np.float64)
+            if ws.sum() > 0:
+                ws = ws / ws.sum()
+            step_values.append(closes.astype(np.float64))
+            step_weights.append(ws)
+
+            # Choose s2 for the path
+            s2_logits_path = predictor.model.decode_s2(context, s1_id)
+            s2_logits_path = s2_logits_path[:, -1, :] / req.T
+            if req.top_k > 0 or req.top_p < 1.0:
+                s2_logits_path = top_k_top_p_filtering(s2_logits_path.clone(), top_k=int(req.top_k), top_p=float(req.top_p))
+            if req.sample_path:
+                s2_id = sample_from_logits(s2_logits_path, temperature=1.0, top_k=None, top_p=None, sample_logits=True).view(1, 1)
+            else:
+                probs2 = torch.softmax(s2_logits_path, dim=-1)
+                s2_id = torch.topk(probs2, k=1, dim=-1)[1].view(1, 1)
+
+            # Advance path tokens
+            s1_cur = torch.cat([s1_cur, s1_id.to(device)], dim=1)
+            s2_cur = torch.cat([s2_cur, s2_id.to(device)], dim=1)
+
+            # Decode current path close value
+            z_path = predictor.tokenizer.decode([s1_cur, s2_cur], half=True)
+            close_val = z_path[:, -1, 3].detach().cpu().numpy()[0]
+            close_val = float(close_val * (x_std[3] + 1e-5) + x_mean[3])
+            path_closes.append(close_val)
+
+        # Decode full path OHLC for K-line (last pred_len steps)
+        z_full = predictor.tokenizer.decode([s1_cur, s2_cur], half=True)
+        z_full = z_full[:, -req.pred_len:, :].detach().cpu().numpy()[0]
+        z_full = z_full * (x_std + 1e-5) + x_mean
+        pred_df = pd.DataFrame(z_full, columns=["open", "high", "low", "close", "volume", "amount"], index=y_ts)
+
+        # 3) Build global price grid
+        pooled = np.concatenate(step_values, axis=0)
+        vmin, vmax = float(np.min(pooled)), float(np.max(pooled))
+        if vmin == vmax:
+            vmin -= 1e-6
+            vmax += 1e-6
+        bins = int(req.bins)
+        edges = np.linspace(vmin, vmax, bins + 1)
+        centers = (edges[:-1] + edges[1:]) / 2.0
+
+        # 4) Weighted hist per step
+        Z = np.zeros((bins, req.pred_len), dtype=np.float64)
+        for j in range(req.pred_len):
+            vals = step_values[j]
+            ws = step_weights[j]
+            hist, _ = np.histogram(vals, bins=edges, weights=ws)
+            Z[:, j] = hist
+
+        # 5) Normalize
+        if req.normalize == "column":
+            for j in range(req.pred_len):
+                s = Z[:, j].sum()
+                if s > 0:
+                    Z[:, j] /= s
+        elif req.normalize == "global":
+            s = Z.sum()
+            if s > 0:
+                Z /= s
+        else:
+            raise HTTPException(status_code=400, detail="normalize must be 'column' or 'global'")
+
+        ridge_path = [float(v) for v in path_closes]
+
+        mode_from_hist = None
+        expected_from_hist = None
+        if req.include_mode:
+            ridge_idx = np.argmax(Z, axis=0)
+            mode_from_hist = centers[ridge_idx].astype(float).tolist()
+        if req.include_expected:
+            col_sums = Z.sum(axis=0) + 1e-12
+            expected_from_hist = [float(np.dot(Z[:, j], centers) / col_sums[j]) for j in range(req.pred_len)]
+
+        times = [int(pd.Timestamp(t).timestamp()) for t in pd.DatetimeIndex(y_ts)]
+
+        prediction_payload = [
+            {
+                "time": times[i],
+                "open": float(r.open),
+                "high": float(r.high),
+                "low": float(r.low),
+                "close": float(r.close),
+                "volume": float(r.volume),
+            }
+            for i, r in enumerate(pred_df.itertuples(index=False))
+        ]
+
+        return ExplainPredictPathResponse(
+            symbol=req.symbol,
+            interval=req.interval,
+            times=times,
+            prediction=prediction_payload,
+            priceGrid=centers.astype(float).tolist(),
+            probMatrix=Z.tolist(),
+            ridge_path=ridge_path,
+            mode_from_hist=mode_from_hist,
+            expected_from_hist=expected_from_hist,
         )
 
 # ---------------------- Scheduler for periodic prediction push ----------------------
