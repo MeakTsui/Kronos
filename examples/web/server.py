@@ -1,6 +1,7 @@
 import os
 import sys
 import asyncio
+import time
 from typing import List, Optional, Dict, Any, Tuple
 
 import numpy as np
@@ -503,6 +504,7 @@ def predict_prob_beam(req: ProbBeamRequest):
             # Batch decode tokenizer for efficiency
             s1_dec = torch.cat([b.s1 for b in beams], dim=0)
             s2_dec = torch.cat([b.s2 for b in beams], dim=0)
+
             z = predictor.tokenizer.decode([s1_dec, s2_dec], half=True)  # [B, T, D]
             last_close = z[:, -1, 3].detach().cpu().numpy()  # normalized space
             # inverse norm
@@ -641,6 +643,7 @@ async def _scheduler_loop():
         return
     print(f"[scheduler] started, every {SCHED_INTERVAL_SEC}s, target={CRICKET_API_BASE}")
     while True:
+        loop_start = time.time()
         try:
             jobs = _fetch_symbols_to_predict()
             if not jobs:
@@ -649,6 +652,7 @@ async def _scheduler_loop():
 
             groups = _group_jobs(jobs)
             for (interval, lookback, pred_len, samples, show_band, band_low, band_high), items in groups.items():
+                group_start = time.time()
                 # Prepare per-symbol data
                 dfs: List[pd.DataFrame] = []
                 x_ts_list: List[pd.Series] = []
@@ -688,6 +692,7 @@ async def _scheduler_loop():
                     N = len(dfs)
                     for start in range(0, N, B):
                         end = min(start + B, N)
+                        batch_start = time.time()
                         dfs_b = dfs[start:end]
                         x_ts_b = x_ts_list[start:end]
                         y_ts_b = y_ts_list[start:end]
@@ -786,13 +791,20 @@ async def _scheduler_loop():
                             except Exception:
                                 pass
 
+                        batch_elapsed = time.time() - batch_start
+                        print(f"[scheduler] batch {start}-{end} ({len(symbols_b)} syms) took {batch_elapsed:.2f}s; mode={'samples' if (show_band and samples>=2) else 'deterministic'}")
                 except Exception as e:
                     print(f"[scheduler] predict batch error: {e}")
                     continue
 
+                group_elapsed = time.time() - group_start
+                print(f"[scheduler] group interval={interval} lookback={lookback} pred_len={pred_len} samples={samples} processed {len(items)} jobs in {group_elapsed:.2f}s")
+
         except Exception as e:
             print(f"[scheduler] loop error: {e}")
 
+        loop_elapsed = time.time() - loop_start
+        print(f"[scheduler] full cycle took {loop_elapsed:.2f}s")
         await asyncio.sleep(SCHED_INTERVAL_SEC)
 
 
