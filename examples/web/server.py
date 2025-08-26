@@ -52,6 +52,7 @@ class PredictRequest(BaseModel):
     show_band: bool = Field(True)
     band_low: float = Field(10.0, ge=0.0, le=50.0)
     band_high: float = Field(90.0, ge=50.0, le=100.0)
+    return_samples: bool = Field(False, description="If true, return all raw sampled prediction paths.")
 
 
 class PredictResponse(BaseModel):
@@ -61,6 +62,7 @@ class PredictResponse(BaseModel):
     prediction: List[dict]
     band_low: Optional[List[dict]] = None
     band_high: Optional[List[dict]] = None
+    samples_raw: Optional[List[List[dict]]] = None
 
 
 # -------- Probability Matrix API (for heatmap/contour/fan chart) --------
@@ -208,8 +210,10 @@ def predict(req: PredictRequest):
     y_ts = pd.Series(make_future_timestamps(last_ts, req.interval, req.pred_len))
 
     # 3) Predict
-    if req.show_band and req.samples >= 2:
-        mean_pred_df, samples = predictor.predict_with_samples(
+    samples_arr = None
+    if req.return_samples:
+        # 当需要返回原始样本时，始终进行带样本预测
+        mean_pred_df, samples_arr = predictor.predict_with_samples(
             df=x_df,
             x_timestamp=x_timestamp,
             y_timestamp=y_ts,
@@ -221,27 +225,51 @@ def predict(req: PredictRequest):
             verbose=False,
         )
         pred_df = mean_pred_df
-        # compute percentiles for close
-        close_idx = 3
-        low_q = float(req.band_low)
-        high_q = float(req.band_high)
-        p_low = np.percentile(samples[:, :, close_idx], low_q, axis=0)
-        p_high = np.percentile(samples[:, :, close_idx], high_q, axis=0)
-        band_low = p_low
-        band_high = p_high
+        if req.show_band and req.samples >= 2:
+            close_idx = 3
+            low_q = float(req.band_low)
+            high_q = float(req.band_high)
+            p_low = np.percentile(samples_arr[:, :, close_idx], low_q, axis=0)
+            p_high = np.percentile(samples_arr[:, :, close_idx], high_q, axis=0)
+            band_low = p_low
+            band_high = p_high
+        else:
+            band_low = band_high = None
     else:
-        pred_df = predictor.predict(
-            df=x_df,
-            x_timestamp=x_timestamp,
-            y_timestamp=y_ts,
-            pred_len=req.pred_len,
-            T=req.T,
-            top_k=req.top_k,
-            top_p=req.top_p,
-            sample_count=req.samples,
-            verbose=False,
-        )
-        band_low = band_high = None
+        if req.show_band and req.samples >= 2:
+            mean_pred_df, samples = predictor.predict_with_samples(
+                df=x_df,
+                x_timestamp=x_timestamp,
+                y_timestamp=y_ts,
+                pred_len=req.pred_len,
+                T=req.T,
+                top_k=req.top_k,
+                top_p=req.top_p,
+                sample_count=req.samples,
+                verbose=False,
+            )
+            pred_df = mean_pred_df
+            # compute percentiles for close
+            close_idx = 3
+            low_q = float(req.band_low)
+            high_q = float(req.band_high)
+            p_low = np.percentile(samples[:, :, close_idx], low_q, axis=0)
+            p_high = np.percentile(samples[:, :, close_idx], high_q, axis=0)
+            band_low = p_low
+            band_high = p_high
+        else:
+            pred_df = predictor.predict(
+                df=x_df,
+                x_timestamp=x_timestamp,
+                y_timestamp=y_ts,
+                pred_len=req.pred_len,
+                T=req.T,
+                top_k=req.top_k,
+                top_p=req.top_p,
+                sample_count=req.samples,
+                verbose=False,
+            )
+            band_low = band_high = None
 
     # 4) Build response payload
     def candles_payload(ts_index: pd.DatetimeIndex, df_like: pd.DataFrame):
@@ -271,6 +299,31 @@ def predict(req: PredictRequest):
         band_low_payload = line_payload(y_idx, band_low)
         band_high_payload = line_payload(y_idx, band_high)
 
+    # 构建原始样本返回（可选）
+    samples_payload = None
+    if samples_arr is not None:
+        y_idx = pd.DatetimeIndex(y_ts)
+        times = [int(pd.Timestamp(t).timestamp()) for t in y_idx]
+        S = samples_arr.shape[0]
+        L = samples_arr.shape[1]
+        samples_payload = []
+        for s in range(S):
+            sample_steps = []
+            for i in range(L):
+                o, h, l, c, v, amt = [float(x) for x in samples_arr[s, i, :6]]
+                sample_steps.append(
+                    {
+                        "time": times[i],
+                        "open": o,
+                        "high": h,
+                        "low": l,
+                        "close": c,
+                        "volume": v,
+                        "amount": float(amt),
+                    }
+                )
+            samples_payload.append(sample_steps)
+
     return PredictResponse(
         symbol=req.symbol,
         interval=req.interval,
@@ -278,6 +331,7 @@ def predict(req: PredictRequest):
         prediction=pred,
         band_low=band_low_payload,
         band_high=band_high_payload,
+        samples_raw=samples_payload,
     )
 
 
