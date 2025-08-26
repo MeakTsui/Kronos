@@ -1,0 +1,60 @@
+module.exports = {
+  apps: [
+    {
+      name: "kronos-scheduler",
+      // Run scheduler_client.py directly with python interpreter
+      script: "./examples/scheduler_client.py",
+      interpreter: "/usr/bin/env python3", // adjust if you want a fixed path like /opt/homebrew/bin/python3
+      cwd: process.cwd(),
+      args: [
+        "--server-base", process.env.SERVER_BASE || "http://localhost:8000",
+        "--interval", process.env.DEFAULT_INTERVAL || "5m",
+        "--lookback", process.env.DEFAULT_LOOKBACK || "512",
+        "--pred-len", process.env.DEFAULT_PRED_LEN || "15",
+        "--bins", process.env.EXPLAIN_BINS || "64",
+        "--normalize", process.env.EXPLAIN_NORMALIZE || "column",
+        "--top-k1", process.env.EXPLAIN_TOP_K1 || "8",
+        "--top-k2", process.env.EXPLAIN_TOP_K2 || "16",
+        "--sample-path",
+        "--include-mode",
+        "--include-expected",
+        "--top-p", process.env.EXPLAIN_TOP_P || "0.9",
+        "--top-k", process.env.EXPLAIN_TOP_K || "0",
+        "--batch-size", process.env.BATCH_SIZE || "4",
+        "--timeout", process.env.TIMEOUT_SEC || "30",
+      ],
+      env: {
+        // Cloud API
+        CRICKET_API_BASE: process.env.CRICKET_API_BASE || "http://localhost:8787",
+        CRICKET_API_KEY: process.env.CRICKET_API_KEY || "Nbb@123",
+        // Defaults for client (also duplicated in args for clarity)
+        SERVER_BASE: process.env.SERVER_BASE || "http://localhost:8000",
+        DEFAULT_INTERVAL: process.env.DEFAULT_INTERVAL || "5m",
+        DEFAULT_LOOKBACK: process.env.DEFAULT_LOOKBACK || "512",
+        DEFAULT_PRED_LEN: process.env.DEFAULT_PRED_LEN || "16",
+        DEFAULT_SAMPLES: process.env.DEFAULT_SAMPLES || "1",
+        EXPLAIN_BINS: process.env.EXPLAIN_BINS || "32",
+        EXPLAIN_NORMALIZE: process.env.EXPLAIN_NORMALIZE || "column",
+        EXPLAIN_TOP_K1: process.env.EXPLAIN_TOP_K1 || "8",
+        EXPLAIN_TOP_K2: process.env.EXPLAIN_TOP_K2 || "16",
+        EXPLAIN_SAMPLE_PATH: process.env.EXPLAIN_SAMPLE_PATH || "true",
+        EXPLAIN_INCLUDE_MODE: process.env.EXPLAIN_INCLUDE_MODE || "true",
+        EXPLAIN_INCLUDE_EXPECTED: process.env.EXPLAIN_INCLUDE_EXPECTED || "true",
+        EXPLAIN_T: process.env.EXPLAIN_T || "1.0",
+        EXPLAIN_TOP_P: process.env.EXPLAIN_TOP_P || "0.9",
+        EXPLAIN_TOP_K: process.env.EXPLAIN_TOP_K || "0",
+        BATCH_SIZE: process.env.BATCH_SIZE || "4",
+        TIMEOUT_SEC: process.env.TIMEOUT_SEC || "30",
+      },
+      // Run every 5 minutes
+      cron_restart: "*/5 * * * *",
+      // Do not keep alive after finishing one run
+      autorestart: false,
+      out_file: "./logs/kronos-scheduler.out.log",
+      error_file: "./logs/kronos-scheduler.err.log",
+      log_date_format: "YYYY-MM-DD HH:mm:ss Z",
+      instances: 1,
+      exec_mode: "fork",
+    },
+  ],
+};
