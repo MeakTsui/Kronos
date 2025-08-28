@@ -22,7 +22,7 @@ sys.path.append(PROJ_ROOT)
 from model import Kronos, KronosTokenizer, KronosPredictor  # noqa: E402
 from model.kronos import top_k_top_p_filtering, sample_from_logits  # align sampling logic
 
-BINANCE_BASE = "https://api.binance.com"
+BINANCE_BASE = "https://fapi.binance.com"  # switch to Binance USDT-M Futures API
 INTERVAL_TO_PANDAS = {
     "1m": "1min",
     "3m": "3min",
@@ -128,7 +128,8 @@ class ExplainPredictPathResponse(BaseModel):
 
 
 def fetch_binance_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    url = f"{BINANCE_BASE}/api/v3/klines"
+    # Futures USDT-M endpoint
+    url = f"{BINANCE_BASE}/fapi/v1/klines"
     params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
     r = requests.get(url, params=params, timeout=10)
     if r.status_code != 200:
