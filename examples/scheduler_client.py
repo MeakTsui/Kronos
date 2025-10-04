@@ -41,6 +41,10 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+import boto3
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
+from datetime import datetime
 
 # -------------------------- Config helpers --------------------------
 
@@ -136,6 +140,70 @@ def push_prediction(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         if r.status_code >= 300:
             return False, f"{r.status_code}: {r.text}"
         return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def push_prediction_r2(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """
+    Upload the prediction payload directly to Cloudflare R2 (S3-compatible).
+
+    Required environment variables:
+    - R2_ACCESS_KEY_ID
+    - R2_SECRET_ACCESS_KEY
+    - R2_ACCOUNT_ID
+    - R2_BUCKET
+
+    Optional environment variables:
+    - R2_ENDPOINT (default: https://{ACCOUNT_ID}.r2.cloudflarestorage.com)
+    - R2_REGION (default: auto)
+    - R2_PREFIX (object key prefix, default: predictions)
+
+    Returns (ok, error_message_or_None)
+    """
+    account_id = os.getenv("R2_ACCOUNT_ID")
+    access_key = os.getenv("R2_ACCESS_KEY_ID")
+    secret_key = os.getenv("R2_SECRET_ACCESS_KEY")
+    bucket = os.getenv("R2_BUCKET")
+    region = os.getenv("R2_REGION", "auto")
+    endpoint = os.getenv("R2_ENDPOINT") or (f"https://{account_id}.r2.cloudflarestorage.com" if account_id else None)
+    prefix = os.getenv("R2_PREFIX", "predictions")
+
+    if not all([account_id, access_key, secret_key, bucket]):
+        return False, "missing one of R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET"
+    if not endpoint:
+        return False, "R2_ENDPOINT could not be derived; set R2_ACCOUNT_ID or R2_ENDPOINT"
+
+    # Build an S3 client for Cloudflare R2
+    try:
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=region,
+            config=Config(signature_version="s3v4"),
+        )
+    except Exception as e:
+        return False, f"boto3 client init error: {e}"
+
+    # Compose object keys
+    symbol = str(payload.get("symbol", "unknown")).upper()
+    interval = str(payload.get("interval", "unknown"))
+    created_at = int(payload.get("created_at", int(time.time())))
+    ts = datetime.utcfromtimestamp(created_at).strftime('%Y%m%d_%H%M%S')
+    key_dated = f"{prefix}/{symbol}/{interval}/{ts}.json"
+    key_latest = f"{prefix}/{symbol}/{interval}/latest.json"
+
+    try:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        # Upload dated file
+        s3.put_object(Bucket=bucket, Key=key_dated, Body=body, ContentType="application/json")
+        # Upload/update latest pointer
+        s3.put_object(Bucket=bucket, Key=key_latest, Body=body, ContentType="application/json")
+        return True, None
+    except (ClientError, BotoCoreError) as e:
+        return False, f"r2 upload error: {e}"
     except Exception as e:
         return False, str(e)
 
